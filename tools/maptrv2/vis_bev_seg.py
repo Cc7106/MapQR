@@ -23,6 +23,8 @@ from mmdet3d.utils import get_root_logger
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from mmdet3d.datasets import build_dataset
 
+_MISSING_CANBUS_WARNED = False
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -144,12 +146,61 @@ def select_current_metas(img_metas: Sequence[Any], len_queue: int) -> List[Dict[
     return current
 
 
+def infer_can_bus_dim(model_module: torch.nn.Module) -> int:
+    transformer = getattr(getattr(model_module, "pts_bbox_head", None), "transformer", None)
+    can_bus_mlp = getattr(transformer, "can_bus_mlp", None)
+    if can_bus_mlp is not None and len(can_bus_mlp) > 0:
+        first = can_bus_mlp[0]
+        if hasattr(first, "in_features"):
+            return int(first.in_features)
+    return 18
+
+
+def _normalize_can_bus(value: Any, dim: int) -> np.ndarray:
+    arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    if arr.size == dim:
+        return arr
+    if arr.size > dim:
+        return arr[:dim]
+    out = np.zeros((dim,), dtype=np.float32)
+    out[: arr.size] = arr
+    return out
+
+
+def ensure_can_bus_in_img_metas(img_metas: Sequence[Any], dim: int) -> int:
+    missing = 0
+    for item in img_metas:
+        if isinstance(item, (list, tuple)):
+            metas = item
+        else:
+            metas = [item]
+        for meta in metas:
+            if not isinstance(meta, dict):
+                continue
+            if "can_bus" not in meta or meta["can_bus"] is None:
+                meta["can_bus"] = np.zeros((dim,), dtype=np.float32)
+                missing += 1
+            else:
+                meta["can_bus"] = _normalize_can_bus(meta["can_bus"], dim)
+    return missing
+
+
 def extract_seg_logits(
     model_module: torch.nn.Module,
     img: torch.Tensor,
     img_metas: Sequence[Any],
     points: Optional[Any],
 ) -> Tuple[Optional[torch.Tensor], List[Dict[str, Any]]]:
+    global _MISSING_CANBUS_WARNED
+    can_bus_dim = infer_can_bus_dim(model_module)
+    missing = ensure_can_bus_in_img_metas(img_metas, can_bus_dim)
+    if missing > 0 and not _MISSING_CANBUS_WARNED:
+        print(
+            f"[vis_bev_seg] WARNING: can_bus missing in {missing} meta entries. "
+            f"Filled with zeros (dim={can_bus_dim})."
+        )
+        _MISSING_CANBUS_WARNED = True
+
     if img.dim() == 5:
         img = img.unsqueeze(1)
     img = img.cuda(non_blocking=True)
